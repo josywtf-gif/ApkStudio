@@ -25,7 +25,65 @@ jobs:
           "$SDKM" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Fetch native payload (proot, aapt2, Debian rootfs)
-        run: bash tools/fetch-deps.sh
+        run: |
+          #!/usr/bin/env bash
+          # Downloads native payload into app/: proot (Termux build), libtalloc, aarch64 aapt2, Debian arm64 rootfs.
+          set -euo pipefail
+          ASSETS=app/src/main/assets
+          JNI=app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$ASSETS" "$JNI"
+          T=$(mktemp -d)
+          trap 'rm -rf "$T"' EXIT
+
+          echo "== Termux: proot + libtalloc"
+          REPO=https://packages.termux.dev/apt/termux-main
+          curl -fsSL --retry 3 "$REPO/dists/stable/main/binary-aarch64/Packages" -o "$T/Packages"
+          deb_path() {
+            awk -v p="$1" 'BEGIN{RS="";FS="\n"}
+              {n="";f="";for(i=1;i<=NF;i++){if($i~/^Package: /)n=substr($i,10);if($i~/^Filename: /)f=substr($i,11)}
+               if(n==p){print f;exit}}' "$T/Packages"
+          }
+          for pkg in proot libtalloc; do
+            f=$(deb_path "$pkg")
+            [ -n "$f" ] || { echo "Package $pkg not found in Termux repo"; exit 1; }
+            curl -fsSL --retry 3 "$REPO/$f" -o "$T/$pkg.deb"
+            mkdir -p "$T/$pkg"
+            dpkg-deb -x "$T/$pkg.deb" "$T/$pkg"
+          done
+          PROOT=$(find "$T/proot" -type f -name proot | head -n1)
+          LOADER=$(find "$T/proot" -type f -name loader | head -n1)
+          TALLOC=$(find "$T/libtalloc" -type f -name 'libtalloc.so.2*' | head -n1)
+          [ -n "$PROOT" ] && [ -n "$LOADER" ] && [ -n "$TALLOC" ] || { echo "proot/loader/libtalloc not found in debs"; exit 1; }
+          cp "$PROOT" "$JNI/libproot.so"
+          cp "$LOADER" "$JNI/libproot-loader.so"
+          cp "$TALLOC" "$JNI/libtalloc.so"
+          chmod +x "$JNI"/*.so
+          echo "proot NEEDED:"; readelf -d "$JNI/libproot.so" | grep NEEDED || true
+          bad=$(readelf -d "$JNI/libproot.so" | grep NEEDED | grep -vE 'libc\.so|libdl\.so|libm\.so|liblog\.so|libtalloc\.so' || true)
+          if [ -n "$bad" ]; then echo "Unexpected proot dependencies (need to be bundled too):"; echo "$bad"; exit 1; fi
+
+          echo "== aapt2 aarch64"
+          curl -fsSL --retry 3 -o "$T/tools.zip" \
+            https://github.com/lzhiyong/android-sdk-tools/releases/download/35.0.2/android-sdk-tools-static-aarch64.zip
+          mkdir -p "$T/armtools"
+          unzip -q -o "$T/tools.zip" -d "$T/armtools"
+          AAPT2=$(find "$T/armtools" -type f -name aapt2 | head -n1)
+          [ -n "$AAPT2" ] || { echo "aapt2 not found in archive"; exit 1; }
+          cp "$AAPT2" "$JNI/libaapt2.so"
+          chmod +x "$JNI/libaapt2.so"
+
+          echo "== Debian arm64 rootfs"
+          URL=https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/slim/rootfs.tar.xz
+          if ! curl -fsSL --retry 3 "$URL" -o "$T/rootfs.tar.xz"; then
+            echo "raw download failed, trying sparse clone"
+            git clone --depth 1 --filter=blob:none --sparse -b dist-arm64v8 \
+              https://github.com/debuerreotype/docker-debian-artifacts "$T/dda"
+            git -C "$T/dda" sparse-checkout set bookworm/slim
+            cp "$T/dda/bookworm/slim/rootfs.tar.xz" "$T/rootfs.tar.xz"
+          fi
+          xz -dc "$T/rootfs.tar.xz" | gzip -9 > "$ASSETS/rootfs.tar.gz"
+          tar -tzf "$ASSETS/rootfs.tar.gz" | grep -q 'etc/debian_version' || { echo "rootfs looks wrong"; exit 1; }
+          ls -la "$ASSETS" "$JNI"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
