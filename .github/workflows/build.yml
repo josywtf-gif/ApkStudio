@@ -18,8 +18,11 @@ jobs:
 
       - name: Install Android SDK platform
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          SDKM=$(command -v sdkmanager || true)
+          [ -n "$SDKM" ] || SDKM=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" -name sdkmanager -type f | sort | tail -n 1)
+          test -x "$SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Fetch native payload (proot, aapt2, Debian rootfs)
         run: bash tools/fetch-deps.sh
