@@ -98,15 +98,14 @@ jobs:
           chmod +x "$JNI/libaapt2.so"
 
           echo "== Debian arm64 rootfs"
-          URL=https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/slim/rootfs.tar.xz
-          if ! curl -fsSL --retry 3 "$URL" -o "$T/rootfs.tar.xz"; then
-            echo "raw download failed, trying sparse clone"
-            git clone --depth 1 --filter=blob:none --sparse -b dist-arm64v8 \
+          RPATH=bookworm/slim/oci/blobs/rootfs.tar.gz
+          URL=https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/$RPATH
+          if ! curl -fsSL --retry 3 "$URL" -o "$ASSETS/rootfs.tar.gz"; then
+            echo "raw download failed, trying git"
+            git clone --depth 1 --filter=blob:none --no-checkout -b dist-arm64v8 \
               https://github.com/debuerreotype/docker-debian-artifacts "$T/dda"
-            git -C "$T/dda" sparse-checkout set bookworm/slim
-            cp "$T/dda/bookworm/slim/rootfs.tar.xz" "$T/rootfs.tar.xz"
+            git -C "$T/dda" cat-file -p "HEAD:$RPATH" > "$ASSETS/rootfs.tar.gz"
           fi
-          xz -dc "$T/rootfs.tar.xz" | gzip -9 > "$ASSETS/rootfs.tar.gz"
           tar -tzf "$ASSETS/rootfs.tar.gz" | grep -q 'etc/debian_version' || { echo "rootfs looks wrong"; exit 1; }
           ls -la "$ASSETS" "$JNI"
 
