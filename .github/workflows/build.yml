@@ -1,0 +1,124 @@
+name: Build APK
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Locate project (zip in repo root or plain sources)
+        run: |
+          shopt -s dotglob nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -gt 0 ]; then
+            echo "Unpacking ${zips[0]}"
+            rm -rf project
+            mkdir project
+            unzip -q "${zips[0]}" -d project
+            while [ ! -f project/settings.gradle ] && [ "$(ls -1 project | wc -l)" -eq 1 ] && [ -d "$(ls -d project/*)" ]; do
+              d=$(ls -d project/*)
+              mv "$d" project.tmp
+              rm -rf project
+              mv project.tmp project
+            done
+            echo "PROJECT_DIR=project" >> "$GITHUB_ENV"
+          else
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          fi
+          ls -la "$(grep PROJECT_DIR "$GITHUB_ENV" | cut -d= -f2)"
+          test -f "$(grep PROJECT_DIR "$GITHUB_ENV" | cut -d= -f2)/settings.gradle"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK platform
+        run: |
+          SDKM=$(command -v sdkmanager || true)
+          [ -n "$SDKM" ] || SDKM=$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/cmdline-tools" -name sdkmanager -type f | sort | tail -n 1)
+          test -x "$SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Fetch native payload (proot, aapt2, Debian rootfs)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          #!/usr/bin/env bash
+          # Downloads native payload into app/: proot (Termux build), libtalloc, aarch64 aapt2, Debian arm64 rootfs.
+          set -euo pipefail
+          ASSETS=app/src/main/assets
+          JNI=app/src/main/jniLibs/arm64-v8a
+          mkdir -p "$ASSETS" "$JNI"
+          T=$(mktemp -d)
+          trap 'rm -rf "$T"' EXIT
+
+          echo "== Termux: proot + libtalloc"
+          REPO=https://packages.termux.dev/apt/termux-main
+          curl -fsSL --retry 3 "$REPO/dists/stable/main/binary-aarch64/Packages" -o "$T/Packages"
+          deb_path() {
+            awk -v p="$1" 'BEGIN{RS="";FS="\n"}
+              {n="";f="";for(i=1;i<=NF;i++){if($i~/^Package: /)n=substr($i,10);if($i~/^Filename: /)f=substr($i,11)}
+               if(n==p){print f;exit}}' "$T/Packages"
+          }
+          for pkg in proot libtalloc libandroid-shmem; do
+            f=$(deb_path "$pkg")
+            [ -n "$f" ] || { echo "Package $pkg not found in Termux repo"; exit 1; }
+            curl -fsSL --retry 3 "$REPO/$f" -o "$T/$pkg.deb"
+            mkdir -p "$T/$pkg"
+            dpkg-deb -x "$T/$pkg.deb" "$T/$pkg"
+          done
+          PROOT=$(find "$T/proot" -type f -name proot | head -n1)
+          LOADER=$(find "$T/proot" -type f -name loader | head -n1)
+          TALLOC=$(find "$T/libtalloc" -type f -name 'libtalloc.so.2*' | head -n1)
+          SHMEM=$(find "$T/libandroid-shmem" -name 'libandroid-shmem.so' \( -type f -o -type l \) | head -n1)
+          [ -n "$PROOT" ] && [ -n "$LOADER" ] && [ -n "$TALLOC" ] && [ -n "$SHMEM" ] || { echo "proot/loader/libtalloc/libandroid-shmem not found in debs"; exit 1; }
+          cp "$PROOT" "$JNI/libproot.so"
+          cp "$LOADER" "$JNI/libproot-loader.so"
+          cp "$TALLOC" "$JNI/libtalloc.so"
+          cp -L "$SHMEM" "$JNI/libandroid-shmem.so"
+          chmod +x "$JNI"/*.so
+          echo "proot NEEDED:"; readelf -d "$JNI/libproot.so" | grep NEEDED || true
+          bad=$(for l in libproot libtalloc libandroid-shmem; do readelf -d "$JNI/$l.so" | grep NEEDED; done | grep -vE 'libc\.so|libdl\.so|libm\.so|liblog\.so|libtalloc\.so|libandroid-shmem\.so' || true)
+          if [ -n "$bad" ]; then echo "Unexpected proot dependencies (need to be bundled too):"; echo "$bad"; exit 1; fi
+
+          echo "== aapt2 aarch64"
+          curl -fsSL --retry 3 -o "$T/tools.zip" \
+            https://github.com/lzhiyong/android-sdk-tools/releases/download/35.0.2/android-sdk-tools-static-aarch64.zip
+          mkdir -p "$T/armtools"
+          unzip -q -o "$T/tools.zip" -d "$T/armtools"
+          AAPT2=$(find "$T/armtools" -type f -name aapt2 | head -n1)
+          [ -n "$AAPT2" ] || { echo "aapt2 not found in archive"; exit 1; }
+          cp "$AAPT2" "$JNI/libaapt2.so"
+          chmod +x "$JNI/libaapt2.so"
+
+          echo "== Debian arm64 rootfs"
+          URL=https://raw.githubusercontent.com/debuerreotype/docker-debian-artifacts/dist-arm64v8/bookworm/slim/rootfs.tar.xz
+          if ! curl -fsSL --retry 3 "$URL" -o "$T/rootfs.tar.xz"; then
+            echo "raw download failed, trying sparse clone"
+            git clone --depth 1 --filter=blob:none --sparse -b dist-arm64v8 \
+              https://github.com/debuerreotype/docker-debian-artifacts "$T/dda"
+            git -C "$T/dda" sparse-checkout set bookworm/slim
+            cp "$T/dda/bookworm/slim/rootfs.tar.xz" "$T/rootfs.tar.xz"
+          fi
+          xz -dc "$T/rootfs.tar.xz" | gzip -9 > "$ASSETS/rootfs.tar.gz"
+          tar -tzf "$ASSETS/rootfs.tar.gz" | grep -q 'etc/debian_version' || { echo "rootfs looks wrong"; exit 1; }
+          ls -la "$ASSETS" "$JNI"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ApkStudio-debug
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
