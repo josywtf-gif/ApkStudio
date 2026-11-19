@@ -106,7 +106,8 @@ jobs:
               https://github.com/debuerreotype/docker-debian-artifacts "$T/dda"
             git -C "$T/dda" cat-file -p "HEAD:$RPATH" > "$ASSETS/rootfs.tar.gz"
           fi
-          tar -tzf "$ASSETS/rootfs.tar.gz" | grep -q 'etc/debian_version' || { echo "rootfs looks wrong"; exit 1; }
+          tar -tzf "$ASSETS/rootfs.tar.gz" > "$T/rootfs.list"
+          grep -q 'etc/debian_version' "$T/rootfs.list" || { echo "rootfs looks wrong"; exit 1; }
           ls -la "$ASSETS" "$JNI"
 
       - uses: gradle/actions/setup-gradle@v4
@@ -121,3 +122,4 @@ jobs:
         with:
           name: ApkStudio-debug
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          
