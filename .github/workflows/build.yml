@@ -118,6 +118,18 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: gradle assembleDebug --no-daemon --stacktrace
 
+      - name: Verify APK payload
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -n1)
+          unzip -l "$APK" > "$RUNNER_TEMP/apk.list"
+          for f in assets/rootfs.tar.gz assets/setup.sh assets/build.sh \
+                   lib/arm64-v8a/libproot.so lib/arm64-v8a/libproot-loader.so \
+                   lib/arm64-v8a/libtalloc.so lib/arm64-v8a/libandroid-shmem.so \
+                   lib/arm64-v8a/libaapt2.so; do
+            if grep -q -- " $f\$" "$RUNNER_TEMP/apk.list"; then echo "ok  $f"; else echo "MISSING $f"; tail -30 "$RUNNER_TEMP/apk.list"; exit 1; fi
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: ApkStudio-debug
